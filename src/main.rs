@@ -282,9 +282,15 @@ async fn main() {
             // --- 3. 매수/매도 로직 판단 (가상 매매 모드) ---
             // A. 매수 로직 (상승 추세 & RSI 눌림목 & 자산 80% 미만 보유)
             if ema20 > ema50 && rsi14 < 40.0 && btc_eval_val < (total_assets * 0.8) {
-                let rsi_weight = 1.0 + (40.0 - rsi14) / 20.0; // RSI가 낮을수록 더 많이 매수
-                let mut buy_amount = 10000.0 * rsi_weight; // 기본 단위 1만원 기준 가변
-                buy_amount = buy_amount.min(krw_val * 0.9).min((total_assets * 0.8) - btc_eval_val);
+                let base_unit = 5000.0;
+
+                let rsi_weight = 1.0 + (40.0 - rsi14) / 40.0;
+
+                let mut buy_amount = base_unit * rsi_weight;
+
+                buy_amount = buy_amount
+                    .min(krw_val * 0.3)
+                    .min((total_assets * 0.8) - btc_eval_val);
         
                 if buy_amount >= 5000.0 {
                     // 대신 디스코드 알림만 전송합니다.
@@ -293,7 +299,7 @@ async fn main() {
                     buy_amount, rsi14
                     )).await;
                     // GPT의 실제 매매 주문
-                    //buy_order(&client, &access_key, &secret_key, buy_amount).await;
+                    buy_order(&client, &access_key, &secret_key, buy_amount).await;
                 }
             }
             // B. 매도 로직 (익절 2.1% 이상 OR 손절 -3.1% 이하)
@@ -310,7 +316,7 @@ async fn main() {
                         type_str, current_profit_pct, current_price, rsi14
                     )).await;
                     // GPT의 실제 매매 주문
-                    //sell_order(&client, &access_key, &secret_key, btc_amount).await;
+                    sell_order(&client, &access_key, &secret_key, btc_amount).await;
                 }
             }
         }
