@@ -248,7 +248,9 @@ async fn main() {
             candles.reverse();
             let prices: Vec<f64> = candles.iter().map(|c| c.trade_price).collect();
             let current_candle = candles.last().unwrap();
-            let current_price = *prices.last().unwrap();
+            let current_price = current_candle.trade_price;
+            let current_open = current_candle.opening_price;
+            let current_volume = current_candle.candle_acc_trade_volume;
             let ema20 = calculate_ema(&prices, 20);
             let ema50 = calculate_ema(&prices, 50);
             let rsi14 = calculate_rsi(&prices, 14);
