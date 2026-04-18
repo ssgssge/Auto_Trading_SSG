@@ -8,7 +8,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use chrono::Local;
 use sha2::{Sha512, Digest};
 
-/* gpt야 니가 만들라메 왜 이게 오류야
+/* 변수 설정 메인에 넣음
 let query = "market=KRW-BTC&side=bid&price=10000&ord_type=price";
 let hash = Sha512::digest(query.as_bytes());
 let query_hash = format!("{:x}", hash);
@@ -32,7 +32,11 @@ struct Balance {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct UpbitCandle { trade_price: f64 }
+struct UpbitCandle {
+    trade_price: f64,
+    opening_price: f64,
+    candle_acc_trade_volume: f64,
+}
 
 #[derive(Debug, Deserialize)]
 struct OrderResponse { uuid: String, side: String }
@@ -223,10 +227,12 @@ async fn main() {
     let secret_key = env::var("UPBIT_SECRET_KEY").expect("SECRET_KEY missing");
     let client = reqwest::Client::new();
     let mut log_counter = 0; //콘솔 출력 카운터
+    let mut highest_held_price: f64 = 0.0;//매수이후 최고점 저장 변수
 
     alert("🚀 **자동 매매 시스템이 가동되었습니다!** (전략: EMA+RSI 하이브리드)").await;
 
     loop {
+        
         // --- 1. 시세 조회 (15분봉 100개) ---
         let candle_url = "https://api.upbit.com/v1/candles/minutes/15?market=KRW-BTC&count=100";
         let res = match client.get(candle_url).send().await {
@@ -241,10 +247,16 @@ async fn main() {
         if let Ok(mut candles) = res.json::<Vec<UpbitCandle>>().await {
             candles.reverse();
             let prices: Vec<f64> = candles.iter().map(|c| c.trade_price).collect();
+            let current_candle = candles.last().unwrap();
             let current_price = *prices.last().unwrap();
             let ema20 = calculate_ema(&prices, 20);
             let ema50 = calculate_ema(&prices, 50);
             let rsi14 = calculate_rsi(&prices, 14);
+            //최근20개 캔들의 평균 계산량 계산
+            let vol_sma20: f64 = candles.iter().rev().skip(1).take(20).map(|c| c.candle_acc_trade_volume).sum::<f64>() / 20.0;
+            // 현재 RSI와 직전 캔들의 RSI를 비교하기 위해 두 개를 계산
+            let rsi_current = calculate_rsi(&prices, 14);
+            let rsi_prev = calculate_rsi(&prices[0..prices.len()-1], 14);
             
             //300초당 1회 콘솔 출력 (너무 자주 출력하면 로그가 지저분해질 수 있어서) + 시간출력
             log_counter += 1;
@@ -278,13 +290,26 @@ async fn main() {
             let total_assets = krw_val + btc_eval_val;
             let current_profit_pct = if btc_avg_price > 0.0 { (current_price - btc_avg_price) / btc_avg_price * 100.0 } else { 0.0 };
 
+            // --- 💡 트레일링 스탑 상태 업데이트 ---
+            if btc_amount > 0.0001 {
+                if current_price > highest_held_price {
+                    highest_held_price = current_price; // 코인을 들고 있는 동안 최고점 갱신
+                }
+            } else {
+                highest_held_price = 0.0; // 코인이 없으면 초기화
+            }
 
             // --- 3. 매수/매도 로직 판단 (가상 매매 모드) ---
-            // A. 매수 로직 (상승 추세 & RSI 눌림목 & 자산 80% 미만 보유)
+            // A. 매수 로직 (NEW 로직)
+            let is_uptrend = ema20 > ema50;
+            let is_green_candle = current_price > current_open; // 양봉 확인
+            let is_rsi_hook = rsi_prev < 40.0 && rsi_current > rsi_prev; // RSI가 40 미만에서 위로 꺾임
+            let is_vol_spike = current_volume > (vol_sma20 * 1.5); // 평균 거래량 대비 1.5배 터짐
+
             if ema20 > ema50 && rsi14 < 40.0 && btc_eval_val < (total_assets * 0.8) {
                 let base_unit = 5000.0;
 
-                let rsi_weight = 1.0 + (40.0 - rsi14) / 40.0;
+                let rsi_weight = 1.0 + (40.0 - rsi_current.max(20.0)) / 20.0;
 
                 let mut buy_amount = base_unit * rsi_weight;
 
@@ -294,29 +319,37 @@ async fn main() {
         
                 if buy_amount >= 5000.0 {
                     // 대신 디스코드 알림만 전송합니다.
-                    alert(&format!(
-                   "🧪 **[가상 매수 신호]**\n- 매수 예정 금액: {:.0}원\n- 현재 RSI: {:.2}\n- 상태: EMA 정배열 구간",
-                    buy_amount, rsi14
+                        alert(&format!(
+                        "🧪 **[매수 신호 - 바닥 확인!]**\n- 💰 예상 금액: {:.0}원\n- 📊 RSI 훅: {:.2} ➡️ {:.2}\n- 📈 거래량 급증 확인", 
+                        buy_amount, rsi_prev, rsi_current
                     )).await;
                     // GPT의 실제 매매 주문
                     buy_order(&client, &access_key, &secret_key, buy_amount).await;
                 }
             }
-            // B. 매도 로직 (익절 2.1% 이상 OR 손절 -3.1% 이하)
+            // B. 매도 로직 (트레일링 스탑 & 손절)
             if btc_amount > 0.0001 {
-                let is_profit = rsi14 > 70.0 && current_profit_pct >= 2.1;
-                let is_loss = current_profit_pct <= -3.1;
+                // 1. 트레일링 스탑 조건: 최고 수익률이 2.0%를 넘었고, 최고점에서 1.0% 이상 하락했을 때
+                let highest_profit_pct = (highest_held_price - btc_avg_price) / btc_avg_price * 100.0;
+                let drop_from_highest = (highest_held_price - current_price) / highest_held_price * 100.0;
+                
+                let is_trailing_stop = highest_profit_pct >= 2.0 && drop_from_highest >= 1.0;
+                let is_stop_loss = current_profit_pct <= -3.1;
 
-                if is_profit || is_loss {
-                    let type_str = if is_profit { "💰 가상 익절" } else { "⚠️ 가상 손절" };
-
-                    // 대신 디스코드 알림만 전송합니다.
+                if is_trailing_stop {
                     alert(&format!(
-                        "{} **신호 포착**\n- 수익률: {:.2}%\n- 현재 가격: {:.0}원\n- RSI: {:.2}",
-                        type_str, current_profit_pct, current_price, rsi14
+                        "💰 **[트레일링 익절]** 고점 대비 하락!\n- 🚀 도달했던 최고 수익률: {:.2}%\n- 📉 현재 수익률: {:.2}%", 
+                        highest_profit_pct, current_profit_pct
                     )).await;
-                    // GPT의 실제 매매 주문
                     sell_order(&client, &access_key, &secret_key, btc_amount).await;
+                    highest_held_price = 0.0; // 매도 후 초기화
+                } else if is_stop_loss {
+                    alert(&format!(
+                        "⚠️ **[손절]**\n- 📉 현재 수익률: {:.2}%\n- 방어선 붕괴", 
+                        current_profit_pct
+                    )).await;
+                    sell_order(&client, &access_key, &secret_key, btc_amount).await;
+                    highest_held_price = 0.0;
                 }
             }
         }
