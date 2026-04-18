@@ -38,9 +38,6 @@ struct UpbitCandle {
     candle_acc_trade_volume: f64,
 }
 
-#[derive(Debug, Deserialize)]
-struct OrderResponse { uuid: String, side: String }
-
 // --- 유틸리티: 인증 토큰 생성 ---
 fn create_token_with_query(
     access_key: &str,
@@ -253,12 +250,15 @@ async fn main() {
             let current_volume = current_candle.candle_acc_trade_volume;
             let ema20 = calculate_ema(&prices, 20);
             let ema50 = calculate_ema(&prices, 50);
-            let rsi14 = calculate_rsi(&prices, 14);
             //최근20개 캔들의 평균 계산량 계산
             let vol_sma20: f64 = candles.iter().rev().skip(1).take(20).map(|c| c.candle_acc_trade_volume).sum::<f64>() / 20.0;
             // 현재 RSI와 직전 캔들의 RSI를 비교하기 위해 두 개를 계산
             let rsi_current = calculate_rsi(&prices, 14);
-            let rsi_prev = calculate_rsi(&prices[0..prices.len()-1], 14);
+            let rsi_prev = if prices.len() > 1 {
+                calculate_rsi(&prices[..prices.len()-1], 14)
+            } else {
+                50.0
+            };  
             
             //300초당 1회 콘솔 출력 (너무 자주 출력하면 로그가 지저분해질 수 있어서) + 시간출력
             log_counter += 1;
@@ -267,7 +267,7 @@ async fn main() {
 
                 println!(
                     "[{}] 📊 price: {:.0} | EMA20: {:.2} | EMA50: {:.2} | RSI14: {:.2}",
-                    now, current_price, ema20, ema50, rsi14
+                    now, current_price, ema20, ema50, rsi_current
                 );
 
                 log_counter = 0;
@@ -308,17 +308,12 @@ async fn main() {
             let is_rsi_hook = rsi_prev < 40.0 && rsi_current > rsi_prev; // RSI가 40 미만에서 위로 꺾임
             let is_vol_spike = current_volume > (vol_sma20 * 1.5); // 평균 거래량 대비 1.5배 터짐
 
-            if ema20 > ema50 && rsi14 < 40.0 && btc_eval_val < (total_assets * 0.8) {
-                let base_unit = 5000.0;
+            if is_uptrend && is_rsi_hook && is_green_candle && is_vol_spike && btc_eval_val < (total_assets * 0.8) {
 
                 let rsi_weight = 1.0 + (40.0 - rsi_current.max(20.0)) / 20.0;
 
-                let mut buy_amount = base_unit * rsi_weight;
+                let buy_amount = (10000.0 * rsi_weight).min(krw_val * 0.9);
 
-                buy_amount = buy_amount
-                    .min(krw_val * 0.3)
-                    .min((total_assets * 0.8) - btc_eval_val);
-        
                 if buy_amount >= 5000.0 {
                     // 대신 디스코드 알림만 전송합니다.
                         alert(&format!(
